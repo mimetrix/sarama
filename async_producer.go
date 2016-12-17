@@ -34,6 +34,9 @@ type AsyncProducer interface {
 	// wish to send.
 	Input() chan<- *ProducerMessage
 
+	// Inputs is the batch equivalent to Input()
+	Inputs() chan<- []*ProducerMessage
+
 	// Successes is the success output channel back to the user when AckSuccesses is
 	// enabled. If Return.Successes is true, you MUST read from this channel or the
 	// Producer will deadlock. It is suggested that you send and read messages
@@ -54,6 +57,7 @@ type asyncProducer struct {
 
 	errors                    chan *ProducerError
 	input, successes, retries chan *ProducerMessage
+	inputs                    chan []*ProducerMessage
 	inFlight                  sync.WaitGroup
 
 	brokers    map[*Broker]chan<- *ProducerMessage
@@ -87,12 +91,13 @@ func NewAsyncProducerFromClient(client Client) (AsyncProducer, error) {
 	p := &asyncProducer{
 		client:     client,
 		conf:       client.Config(),
-		errors:     make(chan *ProducerError),
-		input:      make(chan *ProducerMessage),
-		successes:  make(chan *ProducerMessage),
+		errors:     make(chan *ProducerError, client.Config().ChannelBufferSize),
+		input:      make(chan *ProducerMessage, client.Config().ChannelBufferSize),
+		inputs:     make(chan []*ProducerMessage, client.Config().ChannelBufferSize),
+		successes:  make(chan *ProducerMessage, client.Config().ChannelBufferSize),
 		retries:    make(chan *ProducerMessage),
-		brokers:    make(map[*Broker]chan<- *ProducerMessage),
-		brokerRefs: make(map[chan<- *ProducerMessage]int),
+		brokers:    make(map[*Broker]chan<- *ProducerMessage, client.Config().ChannelBufferSize),
+		brokerRefs: make(map[chan<- *ProducerMessage]int, client.Config().ChannelBufferSize),
 	}
 
 	// launch our singleton dispatchers
@@ -195,6 +200,10 @@ func (p *asyncProducer) Input() chan<- *ProducerMessage {
 	return p.input
 }
 
+func (p *asyncProducer) Inputs() chan<- []*ProducerMessage {
+	return p.inputs
+}
+
 func (p *asyncProducer) Close() error {
 	p.AsyncClose()
 
@@ -230,43 +239,51 @@ func (p *asyncProducer) dispatcher() {
 	handlers := make(map[string]chan<- *ProducerMessage)
 	shuttingDown := false
 
-	for msg := range p.input {
-		if msg == nil {
-			Logger.Println("Something tried to send a nil message, it was ignored.")
-			continue
+	go func() {
+		for msg := range p.input {
+			p.inputs <- []*ProducerMessage{msg}
 		}
+	}()
 
-		if msg.flags&shutdown != 0 {
-			shuttingDown = true
-			p.inFlight.Done()
-			continue
-		} else if msg.retries == 0 {
-			if shuttingDown {
-				// we can't just call returnError here because that decrements the wait group,
-				// which hasn't been incremented yet for this message, and shouldn't be
-				pErr := &ProducerError{Msg: msg, Err: ErrShuttingDown}
-				if p.conf.Producer.Return.Errors {
-					p.errors <- pErr
-				} else {
-					Logger.Println(pErr)
-				}
+	for msgs := range p.inputs {
+		for _, msg := range msgs {
+			if msg == nil {
+				Logger.Println("Something tried to send a nil message, it was ignored.")
 				continue
 			}
-			p.inFlight.Add(1)
-		}
 
-		if msg.byteSize() > p.conf.Producer.MaxMessageBytes {
-			p.returnError(msg, ErrMessageSizeTooLarge)
-			continue
-		}
+			if msg.flags&shutdown != 0 {
+				shuttingDown = true
+				p.inFlight.Done()
+				continue
+			} else if msg.retries == 0 {
+				if shuttingDown {
+					// we can't just call returnError here because that decrements the wait group,
+					// which hasn't been incremented yet for this message, and shouldn't be
+					pErr := &ProducerError{Msg: msg, Err: ErrShuttingDown}
+					if p.conf.Producer.Return.Errors {
+						p.errors <- pErr
+					} else {
+						Logger.Println(pErr)
+					}
+					continue
+				}
+				p.inFlight.Add(1)
+			}
 
-		handler := handlers[msg.Topic]
-		if handler == nil {
-			handler = p.newTopicProducer(msg.Topic)
-			handlers[msg.Topic] = handler
-		}
+			if msg.byteSize() > p.conf.Producer.MaxMessageBytes {
+				p.returnError(msg, ErrMessageSizeTooLarge)
+				continue
+			}
 
-		handler <- msg
+			handler := handlers[msg.Topic]
+			if handler == nil {
+				handler = p.newTopicProducer(msg.Topic)
+				handlers[msg.Topic] = handler
+			}
+
+			handler <- msg
+		}
 	}
 
 	for _, handler := range handlers {
@@ -521,9 +538,9 @@ func (pp *partitionProducer) updateLeader() error {
 // one per broker; also constructs an associated flusher
 func (p *asyncProducer) newBrokerProducer(broker *Broker) chan<- *ProducerMessage {
 	var (
-		input     = make(chan *ProducerMessage)
-		bridge    = make(chan *produceSet)
-		responses = make(chan *brokerProducerResponse)
+		input     = make(chan *ProducerMessage, p.conf.ChannelBufferSize)
+		bridge    = make(chan *produceSet, p.conf.ChannelBufferSize)
+		responses = make(chan *brokerProducerResponse, p.conf.ChannelBufferSize)
 	)
 
 	bp := &brokerProducer{
@@ -818,6 +835,7 @@ func (p *asyncProducer) shutdown() {
 	}
 
 	close(p.input)
+	close(p.inputs)
 	close(p.retries)
 	close(p.errors)
 	close(p.successes)
